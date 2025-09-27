@@ -1,0 +1,268 @@
+
+import os
+import pandas as pd
+import openai
+import base64
+import logging
+import re 
+
+
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from google.oauth2.credentials import Credentials
+from googleapiclient.errors import HttpError
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+
+from flask import Flask, request
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+# ssh key stored in .ssh directory
+# Enter the instance through terminal: ssh macke@35.184.146.128
+# activate virtual environment: source ~/myenv/bin/activate
+
+df = pd.read_csv("context.csv")
+
+
+
+logging.basicConfig(
+    filename='./logs/email_bot.log',  # Log file path
+    level=logging.INFO,  # Logging level (can be DEBUG, INFO, WARNING, ERROR, CRITICAL)
+    format='%(asctime)s - %(levelname)s - %(message)s',  # Log format
+)
+
+
+logging.info("Script Running")
+
+
+SCOPES = [
+    'https://www.googleapis.com/auth/gmail.readonly',
+    'https://www.googleapis.com/auth/gmail.modify',
+    'https://www.googleapis.com/auth/gmail.send',
+    'https://www.googleapis.com/auth/gmail.compose',
+    'https://www.googleapis.com/auth/gmail.labels'
+]
+
+def load_credentials():
+    creds = None
+    # Check if credentials token already exists
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    else:
+        flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+
+        # Explicitly set the redirect URI for manual input of auth code
+        flow.redirect_uri = 'http://localhost:8000'  # Make sure this is set in your Google Cloud Console
+
+        # Generate the authorization URL
+        auth_url, _ = flow.authorization_url(
+            access_type='offline',
+            prompt='consent'
+        )
+
+        # Print the URL for manual authorization
+        print(f"Please visit this URL to authorize the application: {auth_url}")
+
+        # After visiting the URL and authorizing, Google provides an authorization code
+        code = input("Enter the authorization code here: ")
+
+        # Fetch the OAuth token using the authorization code
+        flow.fetch_token(code=code)
+
+        # Save credentials for future use
+        creds = flow.credentials
+        with open('token.json', 'w') as token_file:
+            token_file.write(creds.to_json())
+
+        print("Authorization successful.")
+
+    return creds
+    
+
+def get_response(query, df):
+
+    logging.info(f'responding to query: {query}')
+
+    # Generate a response using the AI with the context from the CSV
+    context = "Use the following context to answer the query as accurately as possible. The sports camp name is Brookwood Hills Sports Camp. Read all the information before sending a response and decide which information is relevant to the question you are asked. If there is a indication that the person would like to sign up for camp, there will be a link to a form attached below. You do not need to include the link to the form because I will append it after the response that you generate. Read the CSV for context on frequently asked questions:"
+    for i, row in df.iterrows():
+        context += f"\nQ: {row['Question']}\nA: {row['Answer']}"
+    
+    context += f"\nUser query: {query}\nResponse:"
+
+    response = openai.chat.completions.create(
+        model="gpt-3.5-turbo",  # Use the appropriate model
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": context},
+        ],
+    )
+
+    response_text = response.choices[0].message.content.strip()
+
+    # Cleanup response text formatting
+    response_text = response_text.replace('\n\n', '\n').replace('\n', ' ').strip()  # Cleanup newlines
+    response_text = response_text.replace('  ', ' ')  # Remove any double spaces
+
+    # Check for registration link insertion if relevant
+    response_text = check_for_registration_query(query, response_text)
+    
+    # Calculate confidence score
+   
+    return response_text
+
+    
+def send_email(service, user_id, to, subject, message_text, thread_id, in_reply_to_message_id):
+
+    # Start building the HTML content
+    html_content = f"""
+    <html>
+      <head>
+        <style>
+          body {{font-family: 'Roboto, Arial';line-height: 1.6;color: #333;}}
+          h1 {{color: #006600;}}
+          .content {{margin: 20px;}}
+          .footer {{margin-top: 20px; padding-top: 10px; border-top: 1px solid #ccc;font-size: 0.9em; }}
+          .footer a {{color: #0056b3; text-decoration: none; }}
+          .disclaimer {{ margin-top: 40px;  color: #999; font-size: 0.7em; font-style: italic; text-align: left;}}
+        </style>
+      </head>
+      <body>
+        <div class="content">
+          <h1>Hello,</h1>
+          <p>{message_text}</p>
+        </div>
+        <div class="footer">
+          <p>
+           <div class="disclaimer">
+        This message was generated by OpenAI 1.43.0. If there was an error, please contact <a href="mailto:mackthompson16@gmail.com" style="color: #999; text-decoration: none;">mackthompson16@gmail.com</a> to diagnose the issue.
+            </div>
+          </p>
+        </div>
+      </body>
+    </html>
+    """
+
+    message = MIMEMultipart("alternative")
+    message["to"] = to
+    message["subject"] = subject
+    message['In-Reply-To'] = in_reply_to_message_id  
+    message['References'] = in_reply_to_message_id  
+    message.attach(MIMEText(html_content, "html"))
+
+    raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+
+    body = {
+        'raw': raw_message,
+        'threadId': thread_id  
+    }
+
+    
+    try:
+        # Send the email using the Gmail API
+        message = service.users().messages().send(userId=user_id, body=body).execute()
+        print(f"Message sent to {to} with Message Id: {message['id']}")
+    except HttpError as error:
+        print(f'An error occurred: {error}')
+
+
+def check_for_registration_query(query, response_text):
+    # Define keywords or phrases related to signing up or checking room availability
+    signup_keywords = ["sign up", "register", "room", "availability", "spot", "join"]
+    
+    # Convert query to lower case for case-insensitive matching
+    query_lower = query.lower()
+
+    # Check if any of the keywords are in the query
+    if any(keyword in query_lower for keyword in signup_keywords):
+        # Remove any existing URLs (if the AI generated one) to avoid duplication
+        response_text = re.sub(r'https?://\S+', '', response_text).strip()
+
+        # Append the formatted registration form message and link to the response
+        response_text += "<br><br>"
+        response_text += '<strong style="font-size: 1.2em;"><a href="https://forms.gle/YvXQ58rELbWTukKQ7">Registration Form</a></strong>'
+    
+    return response_text
+
+def contains_undesired_phrases(response_text):
+    
+    undesired_phrases = [
+        "database",   
+        "I apologize",
+        "Unfortunately", 
+        "I am not sure", 
+        "query",
+        "assist",
+        "corresponding",
+        "sorry",
+        "question",
+        "information"
+    ]
+    
+    for phrase in undesired_phrases:
+        if phrase in response_text:
+            return True
+    return False
+
+app = Flask(__name__)
+
+@app.route('/inbox-update', methods=['POST'])
+def inbox_update():
+   
+    message = request.get_json()
+    if 'message' in message and 'data' in message['message']:
+        # Decode and process the Pub/Sub message
+        pubsub_message = base64.b64decode(message['message']['data']).decode('utf-8')
+        print(f"Received Pub/Sub message: {pubsub_message}")
+
+        creds = load_credentials()
+        service = build('gmail', 'v1', credentials=creds)
+
+        try:
+            # Get the most recent unread message from the inbox
+            results = service.users().messages().list(userId='me', labelIds=['INBOX'], q="is:unread", maxResults=1).execute()
+            messages = results.get('messages', [])
+
+            if not messages:
+                print("No new messages.")
+                return '', 204
+
+            # Retrieve full message details
+            message = messages[0]
+            msg = service.users().messages().get(userId='me', id=message['id']).execute()
+            headers = msg['payload']['headers']
+            thread_id = msg['threadId']
+
+            # Extract sender email and message ID
+            sender_email = None
+            message_id = None
+            for header in headers:
+                if header['name'] == 'From':
+                    sender_email = header['value']
+                elif header['name'] == 'Message-ID':
+                    message_id = header['value']
+
+            # Ensure sender_email and message_id were found
+            if not sender_email or not message_id:
+                print("Missing sender email or message ID. Skipping.")
+                return '', 204
+
+            # Generate response
+            query = msg['snippet']  # Optionally retrieve the full message body
+            response = get_response(query, df)
+
+            if not contains_undesired_phrases(response):
+                send_email(service, 'me', sender_email, "BWH Sports Camp", response, thread_id, message_id)
+
+            # Mark email as read after replying
+            service.users().messages().modify(userId='me', id=message['id'], body={'removeLabelIds': ['UNREAD']}).execute()
+
+        except HttpError as error:
+            print(f'An error occurred: {error}')
+            return '', 500
+
+    return '', 204
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000, debug=True)
