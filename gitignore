@@ -1,5 +1,5 @@
 config/
 logs/
 utils/
-token.json
-credentials.json
+**/token.json
+**/credentials.json
