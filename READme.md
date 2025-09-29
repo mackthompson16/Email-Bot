@@ -11,4 +11,5 @@ After execution:
 3. Determine whether the response is valid via classification and confidence
 4. Send response as reply
 
-_Disclaimer: this repo was made in August 2024, but refactored in September 2025 because of some deprication issues_
+_Disclaimer: this repo was made in August 2024, but refactored in September 2025 because of some deprication issues._
+_Also, the email and google cloud project have been deactivated since I no longer run the camp._
